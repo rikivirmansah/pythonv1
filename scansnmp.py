@@ -1,19 +1,3 @@
-import subprocess
-import sys
-
-def install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-# Install necessary packages
-required_packages = ["pysnmp", "ipaddress", "tqdm", "colorama"]
-for package in required_packages:
-    try:
-        dist = __import__(package)
-        print("{} ({}) is installed".format(dist.__name__, dist.__version__))
-    except ImportError:
-        print("{} is NOT installed".format(package))
-        install(package)
-
 from pysnmp.hlapi import *
 import ipaddress
 import concurrent.futures
@@ -24,7 +8,7 @@ def check_snmp(ip):
     errorIndication, errorStatus, errorIndex, varBinds = next(
         getCmd(SnmpEngine(),
                CommunityData('public'),  # Ganti 'public' dengan community string Anda
-               UdpTransportTarget((str(ip), 161), timeout=0.5, retries=0),  # Set timeout to 0.5 seconds
+               UdpTransportTarget((str(ip), 161)),  # Ganti 'ip_routeros' dengan IP MikroTik Anda
                ContextData(),
                ObjectType(ObjectIdentity('SNMPv2-MIB', 'sysName', 0)))
     )
@@ -49,8 +33,8 @@ def scan_network(network):
     else:
         subnets = [ip_network]
 
-    # Create a ThreadPoolExecutor
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:  # Set max workers to 100
+    # Create a ProcessPoolExecutor
+    with concurrent.futures.ProcessPoolExecutor() as executor:
         # For each subnet, get a list of all hosts and check each one
         for subnet in subnets:
             ip_list = list(subnet.hosts())

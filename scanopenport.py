@@ -1,5 +1,23 @@
 #!/usr/bin/python3
 
+import subprocess
+import sys
+
+# Function to install a package
+def install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# Required libraries
+required_libraries = ["socket", "pyfiglet", "os", "ipaddress", "tqdm", "termcolor"]
+
+# Install missing libraries
+for library in required_libraries:
+    try:
+        __import__(library)
+    except ImportError:
+        install(library)
+
+# Imports (after ensuring the libraries are installed)
 import socket
 import pyfiglet
 import os
@@ -20,7 +38,7 @@ TIMEOUT = 0.5  # socket timeout in seconds
 
 # Define port scanner function
 def portScanner(task):
-    target_ip, port, pbar = task
+    target_ip, port = task
     with socket.socket(ADDRESS_FAMILY, SOCKET_TYPE) as s:
         s.settimeout(TIMEOUT)
         try:
@@ -29,7 +47,6 @@ def portScanner(task):
                 return f"Port {port} is open on {target_ip}"
         except socket.error:
             pass  # do not print anything if the port is closed
-    pbar.update(1)
     return None
 
 # Gets user input and removes any carriage return characters from the input, if the code is running on Windows OS
@@ -58,26 +75,22 @@ except ValueError as e:
 max_workers = multiprocessing.cpu_count() * 500  # Using 500x CPU cores for max_workers
 
 # Calculate total tasks for progress bar
-total_tasks = len(network.hosts()) * (end_port - start_port + 1)
+total_tasks = len(list(network.hosts())) * (end_port - start_port + 1)
 
 # Create progress bar
 pbar = tqdm(total=total_tasks, ncols=70, unit="task")
 
 # Create ThreadPoolExecutor instance
-open_ports = []
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
     # Prepare tasks
-    tasks = [(str(ip_address), port, pbar) for ip_address in network.hosts() for port in range(start_port, end_port + 1)]
-    # Submit tasks
-    results = executor.map(portScanner, tasks)
-    # Collect open ports
-    open_ports = [result for result in results if result is not None]
+    tasks = [(str(ip_address), port) for ip_address in network.hosts() for port in range(start_port, end_port + 1)]
+    # Submit tasks and process results in real-time
+    for result in executor.map(portScanner, tasks):
+        pbar.update(1)  # Update progress bar after each task
+        if result:  # If a port is found open
+            print(colored(result, 'green'))
 
 # Close progress bar
 pbar.close()
-
-# Print open ports
-for open_port in open_ports:
-    print(colored(open_port, 'green'))
 
 print("\nScanning completed.")  # New line before this message

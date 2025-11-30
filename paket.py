@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+import os
 
 # ========== AUTO INSTALL LIBRARY ==========
 def install(package):
@@ -14,17 +15,18 @@ for library in required_libraries:
     except ImportError:
         install(library)
 
-# ========== IMPORT ==========
 import socket
 import pyfiglet
-import os
 from tqdm import tqdm
 from termcolor import colored
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
+import signal
 
 # ========== PORT SCANNER (TCP) ==========
-def portScanner(ip, port, timeout=0.5):
+def portScanner(args):
+    ip, port, timeout = args
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         try:
@@ -35,18 +37,30 @@ def portScanner(ip, port, timeout=0.5):
             pass
     return None
 
-def scan_ports(target_ip, port_min=2, port_max=65000):
+def scan_ports(target_ip, port_min=2, port_max=65000, timeout=0.5):
     logo_text = pyfiglet.figlet_format("Port Scanner")
     print(logo_text)
     print(colored(f"Scanning {target_ip} ports {port_min}-{port_max}...", "yellow"))
     open_ports = []
-    pbar = tqdm(total=port_max-port_min+1, ncols=70, unit="port")
-    for port in range(port_min, port_max+1):
-        result = portScanner(target_ip, port)
-        if result:
-            print(colored(f"Port {port} is OPEN", "green"))
-            open_ports.append(port)
-        pbar.update(1)
+    tasks = [(target_ip, port, timeout) for port in range(port_min, port_max+1)]
+
+    max_workers = os.cpu_count() * 2000
+    print(colored(f"Using {max_workers} threads for fast scanning!", "cyan"))
+    pbar = tqdm(total=len(tasks), ncols=70, unit="port")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_port = {executor.submit(portScanner, task): task[1] for task in tasks}
+        for future in as_completed(future_to_port):
+            pbar.update(1)
+            port = future_to_port[future]
+            try:
+                result = future.result()
+                if result:
+                    print(colored(f"Port {result} is OPEN", "green"))
+                    open_ports.append(result)
+            except Exception as exc:
+                pass
+
     pbar.close()
     return open_ports
 
@@ -110,10 +124,34 @@ def run_traffic_cycle(target_ip, target_port, num_threads, target_rate_mbps, run
         t.join()
 
 # ========== MAIN PROGRAM ==========
+def get_int_input(prompt, default):
+    try:
+        val = int(input(f"{prompt} (default {default}): ") or default)
+        return val
+    except ValueError:
+        print("Input tidak valid, gunakan default.")
+        return default
+
+def menu():
+    print("\n========== PILIH AKSI ==========")
+    print("1. Scan Port saja")
+    print("2. Scan Port lalu lanjut Kirim Paket UDP ke port pilihan")
+    print("0. Keluar")
+    while True:
+        pilih = input("Masukkan pilihan (1/2/0): ")
+        if pilih in ["1", "2", "0"]:
+            return pilih
+        else:
+            print("Input tidak valid, masukkan 1, 2, atau 0.")
+
 def main():
-    # Input target IP
+    print(pyfiglet.figlet_format("Riki Tools"))
     target_ip = input("Masukkan alamat IP target (default 127.0.0.1): ") or "127.0.0.1"
-    # Port scan (default 2-65000)
+    aksi = menu()
+    if aksi == "0":
+        print("Keluar.")
+        return
+
     open_ports = scan_ports(target_ip, 2, 65000)
     if not open_ports:
         print(colored("Tidak ada port terbuka ditemukan. Keluar.", "red"))
@@ -123,7 +161,11 @@ def main():
     for idx, port in enumerate(open_ports):
         print(f"{idx+1}. {port}")
 
-    # Pilih port
+    if aksi == "1":
+        print("\nScan selesai. Tidak lanjut kirim paket.\n")
+        return
+
+    # Pilihan 2: lanjut kirim paket
     while True:
         pilih = input("Pilih port yang akan digunakan untuk traffic UDP (input nomor): ")
         try:
@@ -135,15 +177,6 @@ def main():
                 print("Nomor salah.")
         except:
             print("Input tidak valid.")
-
-    # Parameter traffic generator
-    def get_int_input(prompt, default):
-        try:
-            val = int(input(f"{prompt} (default {default}): ") or default)
-            return val
-        except ValueError:
-            print("Input tidak valid, gunakan default.")
-            return default
 
     num_threads = get_int_input("Masukkan jumlah thread", os.cpu_count() * 2)
     target_rate_mbps = get_int_input("Masukkan target traffic (Mbps)", 100)
@@ -160,7 +193,6 @@ def main():
         stop_signal["stop"] = True
         print("\nSIGINT received, stopping...")
 
-    import signal
     signal.signal(signal.SIGINT, signal_handler)
 
     print(colored(f"\nMulai kirim traffic UDP ke {target_ip}:{target_port}\n", "cyan"))

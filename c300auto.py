@@ -16,7 +16,7 @@ PASSWORD = "zte"
 
 TIMEOUT = 30
 SHOW_TIMEOUT = 180
-CMD_DELAY = 0.02
+CMD_DELAY = 0.01
 
 PROMPT_ANY_REGEX = re.compile(rb"ZXAN(?:\([^)]+\))?#\s*$", re.MULTILINE)
 PROMPT_EXEC_REGEX = re.compile(rb"ZXAN#\s*$", re.MULTILINE)
@@ -24,26 +24,26 @@ PROMPT_EXEC_REGEX = re.compile(rb"ZXAN#\s*$", re.MULTILINE)
 LOGIN_USER = [b"Username:", b"username:", b"Login:", b"login:"]
 LOGIN_PASS = [b"Password:", b"password:"]
 
-DEFAULT_VLANS = [1002, 1001, 996, 33, 31, 30, 27, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6]
+DEFAULT_VLANS = [1002, 1001, 996, 33, 31, 30, 27, 25, 24, 1006, 562, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6]
+DEFAULT_ONU_TYPE = ""  # fallback type (kosong = disable)
 
-# fallback TYPE optional (kosong = disable)
-DEFAULT_ONU_TYPE = ""
+VERIFY_MAX_WAIT_SEC = 0.8
+VERIFY_POLL_INTERVAL_SEC = 0.2
 
-VERIFY_DELAY_SEC = 3.0
-
-# ================== PERUBAHAN SESUAI REQUEST SEBELUMNYA ==================
-WR_AFTER_EACH_SUCCESS = False     # dimatikan (WR per-ONU)
-WR_DELAY_SEC = 1.0
+WR_AFTER_EACH_SUCCESS = True
+WR_DELAY_SEC = 0.2
 
 MAX_PROV_ROUNDS = 10
-SLEEP_BETWEEN_ROUNDS_SEC = 2.0
-
-MAX_ONU_PER_ROUND = 20
+SLEEP_BETWEEN_ROUNDS_SEC = 0.5
 
 START_ONU_ID = 1
 MAX_ONU_ID = 64
 
 OPTIC_CACHE_TTL_SEC = 30.0
+
+# RUNNING CONFIG CACHE (biar gak kebanyakan "show running-config")
+RUNCFG_CACHE_TTL_SEC = 20.0
+RUNCFG_CACHE: Tuple[float, str] = (0.0, "")
 
 # ================== UTIL ==================
 def ts() -> str:
@@ -97,6 +97,48 @@ def parse_csv_ints(s: str) -> List[int]:
                 out.append(int(p))
     return sorted(set(out))
 
+def compress_ranges(nums: List[int]) -> str:
+    nums = sorted(set(int(x) for x in nums if str(x).isdigit()))
+    if not nums:
+        return ""
+    ranges = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        if start == prev:
+            ranges.append(f"{start}")
+        else:
+            ranges.append(f"{start}-{prev}")
+        start = prev = n
+    if start == prev:
+        ranges.append(f"{start}")
+    else:
+        ranges.append(f"{start}-{prev}")
+    return ",".join(ranges)
+
+def chunk_vlan_cmd_ranges(nums: List[int], max_len: int = 180) -> List[str]:
+    """
+    Pecah list VLAN besar jadi beberapa string range agar command tidak kepanjangan.
+    """
+    nums = sorted(set(nums))
+    if not nums:
+        return []
+    chunks: List[List[int]] = []
+    cur: List[int] = []
+    for n in nums:
+        cur.append(n)
+        s = compress_ranges(cur)
+        if len(s) > max_len:
+            # rollback last
+            cur.pop()
+            chunks.append(cur)
+            cur = [n]
+    if cur:
+        chunks.append(cur)
+    return [compress_ranges(c) for c in chunks if c]
+
 def olt_root_from_port(olt_port: str) -> Optional[str]:
     m = re.search(r"(epon-olt_\d+/\d+)(?:/\d+)?$", olt_port, re.IGNORECASE)
     return m.group(1).lower() if m else None
@@ -106,6 +148,42 @@ def onu_prefix_from_olt_port(olt_port: str) -> Optional[str]:
     if not m:
         return None
     return f"epon-onu_{m.group(1)}:"
+
+# ===== MAC helper: FULL atau PREFIX (E0:38:3F:63) =====
+def normalize_mac_or_prefix(s: str) -> Optional[str]:
+    if not s:
+        return None
+    t = s.strip().lower()
+    t = re.sub(r"[^0-9a-f]", "", t)
+    if not re.fullmatch(r"[0-9a-f]+", t):
+        return None
+    if len(t) == 12:
+        return f"{t[0:4]}.{t[4:8]}.{t[8:12]}"
+    if len(t) == 8:
+        return f"{t[0:4]}.{t[4:8]}"
+    if len(t) == 6:
+        return f"{t[0:4]}.{t[4:6]}"
+    return None
+
+def parse_mac_inputs(raw: str) -> List[str]:
+    if not raw:
+        return []
+    parts = re.split(r"[,\s]+", raw.strip())
+    out: List[str] = []
+    seen = set()
+    for p in parts:
+        if not p.strip():
+            continue
+        nm = normalize_mac_or_prefix(p)
+        if nm and nm not in seen:
+            out.append(nm)
+            seen.add(nm)
+    return out
+
+def mac_match(found_mac: str, target: str) -> bool:
+    fm = (found_mac or "").lower()
+    tg = (target or "").lower()
+    return fm == tg or fm.startswith(tg)
 
 # ================== LOGGING ==================
 class Logger:
@@ -150,8 +228,6 @@ class OnuPass:
 class OnuOptic:
     onu_tx_up_dbm: Optional[float] = None
     onu_rx_down_dbm: Optional[float] = None
-    att_up_db: Optional[float] = None
-    att_down_db: Optional[float] = None
 
 def parse_mac_sn_from_unauth_block(text: str) -> Tuple[Optional[str], Optional[str]]:
     mac = None
@@ -218,14 +294,10 @@ def parse_service_ports(text: str) -> Dict[int, int]:
     return ports
 
 def parse_pon_power_attenuation(text: str) -> OnuOptic:
-    m_up = re.search(
-        r"^\s*up\s+Rx\s*:\s*([+-]?\d+(?:\.\d+)?)\s*\(dbm\)\s+Tx\s*:\s*([+-]?\d+(?:\.\d+)?)\s*\(dbm\)\s+([+-]?\d+(?:\.\d+)?)\s*\(dB\)",
-        text, re.IGNORECASE | re.MULTILINE
-    )
-    m_dn = re.search(
-        r"^\s*down\s+Tx\s*:\s*([+-]?\d+(?:\.\d+)?)\s*\(dbm\)\s+Rx\s*:\s*([+-]?\d+(?:\.\d+)?)\s*\(dbm\)\s+([+-]?\d+(?:\.\d+)?)\s*\(dB\)",
-        text, re.IGNORECASE | re.MULTILINE
-    )
+    m_up = re.search(r"^\s*up\s+Rx\s*:\s*([+-]?\d+(?:\.\d+)?)\s*\(dbm\)\s+Tx\s*:\s*([+-]?\d+(?:\.\d+)?)",
+                     text, re.IGNORECASE | re.MULTILINE)
+    m_dn = re.search(r"^\s*down\s+Tx\s*:\s*([+-]?\d+(?:\.\d+)?)\s*\(dbm\)\s+Rx\s*:\s*([+-]?\d+(?:\.\d+)?)",
+                     text, re.IGNORECASE | re.MULTILINE)
     up_tx = None
     dn_rx = None
     if m_up:
@@ -262,36 +334,31 @@ class ZXAN:
         self.flush()
         self.log.info(f"SEND: {cmd}")
         self.tn.write(cmd.encode() + b"\n")
-        time.sleep(CMD_DELAY)
+        if CMD_DELAY > 0:
+            time.sleep(CMD_DELAY)
         return self.read_until_any_prompt(timeout, label)
 
     def send_wait_exec(self, cmd: str, timeout: int, label: str) -> str:
         self.flush()
         self.log.info(f"SEND: {cmd}")
         self.tn.write(cmd.encode() + b"\n")
-        time.sleep(CMD_DELAY)
+        if CMD_DELAY > 0:
+            time.sleep(CMD_DELAY)
         return self.read_until_exec(timeout, label)
 
-    def login(self, username: str, password: str):
-        self.log.info("LOGIN: start")
+    def login_fast(self, username: str, password: str):
+        self.log.info("LOGIN: fast")
         self.tn.write(b"\n")
         time.sleep(0.2)
-        self.tn.expect(LOGIN_USER + [PROMPT_ANY_REGEX], 20)
-
-        for attempt in range(1, 4):
-            self.log.info(f"LOGIN attempt {attempt}/3")
-            self.tn.expect(LOGIN_USER, 20)
-            self.tn.write(username.encode() + b"\n")
-            self.tn.expect(LOGIN_PASS, 20)
-            self.tn.write(password.encode() + b"\n")
-            idx, _, data = self.tn.expect([PROMPT_ANY_REGEX] + LOGIN_USER, 30)
-            out = data.decode(errors="ignore")
-            if "No username or bad password" in out:
-                continue
-            if "ZXAN#" in out:
-                self.log.info("LOGIN OK")
-                return
-        raise RuntimeError("Login gagal 3x")
+        idx, _, _ = self.tn.expect(LOGIN_USER + [PROMPT_ANY_REGEX], 10)
+        if idx == len(LOGIN_USER):
+            self.log.info("LOGIN OK (already logged in)")
+            return
+        self.tn.write(username.encode() + b"\n")
+        self.tn.expect(LOGIN_PASS, 10)
+        self.tn.write(password.encode() + b"\n")
+        self.tn.expect([PROMPT_ANY_REGEX], 15)
+        self.log.info("LOGIN OK")
 
     def close(self):
         self.log.info("CLOSE: exit")
@@ -306,48 +373,62 @@ def go_exec(z: ZXAN):
     z.send_wait_any("end", 20, "go-exec-end")
     z.send_wait_exec("", 5, "go-exec-confirm")
 
-def enter_config(z: ZXAN):
+def ensure_exec(z: ZXAN):
     go_exec(z)
+
+def enter_config(z: ZXAN):
+    ensure_exec(z)
     z.send_wait_any("configure terminal", 20, "cfg")
 
 def enter_olt(z: ZXAN, olt_if: str):
-    go_exec(z)
+    ensure_exec(z)
     z.send_wait_any("configure terminal", 20, "cfg")
     z.send_wait_any("interface epon", 20, "if-epon")
     z.send_wait_any("interface epon-olt", 20, "if-epon-olt")
     z.send_wait_any(f"interface {olt_if}", 20, "if-olt-target")
 
 def end_wr(z: ZXAN):
-    go_exec(z)
+    ensure_exec(z)
     z.send_wait_exec("wr", 180, "wr")
 
-def wr_now(z: ZXAN, note: str = ""):
+def wr_after_each(z: ZXAN, note: str = ""):
+    if not WR_AFTER_EACH_SUCCESS:
+        return
     if note:
-        print(f"   -> WR NOW {note}")
+        print(f"   -> END+WR ({note})")
     end_wr(z)
-    time.sleep(WR_DELAY_SEC)
+    if WR_DELAY_SEC > 0:
+        time.sleep(WR_DELAY_SEC)
 
-# ================== SHOW (quiet) ==================
+# ================== SHOW ==================
 def show_unauthentication(z: ZXAN, olt_if: str, quiet: bool = False) -> str:
     if quiet:
         with silent(z.log):
             enter_config(z)
-            return z.send_wait_any(f"show onu unauthentication {olt_if}", SHOW_TIMEOUT, "show-unauthentication")
+            out = z.send_wait_any(f"show onu unauthentication {olt_if}", SHOW_TIMEOUT, "show-unauthentication")
+            ensure_exec(z)
+            return out
     enter_config(z)
-    return z.send_wait_any(f"show onu unauthentication {olt_if}", SHOW_TIMEOUT, "show-unauthentication")
+    out = z.send_wait_any(f"show onu unauthentication {olt_if}", SHOW_TIMEOUT, "show-unauthentication")
+    ensure_exec(z)
+    return out
 
 def show_authentication(z: ZXAN, olt_if: str, quiet: bool = False) -> str:
     if quiet:
         with silent(z.log):
             enter_config(z)
-            return z.send_wait_any(f"show onu authentication {olt_if}", SHOW_TIMEOUT, "show-authentication")
+            out = z.send_wait_any(f"show onu authentication {olt_if}", SHOW_TIMEOUT, "show-authentication")
+            ensure_exec(z)
+            return out
     enter_config(z)
-    return z.send_wait_any(f"show onu authentication {olt_if}", SHOW_TIMEOUT, "show-authentication")
+    out = z.send_wait_any(f"show onu authentication {olt_if}", SHOW_TIMEOUT, "show-authentication")
+    ensure_exec(z)
+    return out
 
 def show_pon_power_attenuation(z: ZXAN, onu_if: str) -> str:
     with silent(z.log):
-        go_exec(z)
-        return z.send_wait_any(f"show pon power attenuation {onu_if}", 30, f"pon-power-atten-{onu_if}")
+        ensure_exec(z)
+        return z.send_wait_any(f"show pon power attenuation {onu_if}", 30, f"pon-power-{onu_if}")
 
 # ===== OPTIC CACHE =====
 OPTIC_CACHE: Dict[str, Tuple[float, OnuOptic]] = {}
@@ -366,47 +447,41 @@ def get_onu_optic_cached(z: ZXAN, onu_if: str) -> OnuOptic:
     OPTIC_CACHE[k] = (now, val)
     return val
 
-# ================== SERVICE PORT READ/WRITE ==================
-def get_onu_service_ports(z: ZXAN, onu_if: str) -> Dict[int, int]:
-    go_exec(z)
-    z.send_wait_any("configure terminal", 20, "cfg-onu-sp-read")
-    z.send_wait_any(f"interface {onu_if}", 20, f"enter-{onu_if}")
-    out = z.send_wait_any("show this", SHOW_TIMEOUT, f"show-this-{onu_if}")
-    z.send_wait_any("exit", 20, f"exit-{onu_if}")
-    return parse_service_ports(out)
-
-def set_onu_vlans(z: ZXAN, onu_if: str, vlans: List[int], mode: str = "APPEND"):
-    mode = mode.upper().strip()
-    target_vlans = uniq_int_list(vlans)
-    if not target_vlans:
-        return
-
-    existing = get_onu_service_ports(z, onu_if)
-    existing_vlans = set(existing.values())
-
-    go_exec(z)
-    z.send_wait_any("configure terminal", 20, "cfg-onu-sp-write")
-    z.send_wait_any(f"interface {onu_if}", 20, f"enter-{onu_if}")
-
-    if mode == "REPLACE":
-        for sp_id in sorted(existing.keys()):
-            z.send_wait_any(f"no service-port {sp_id}", 20, f"no-sp-{onu_if}-{sp_id}")
-        for sp_id, vlan in enumerate(target_vlans, start=1):
-            z.send_wait_any(f"service-port {sp_id} vport 1 user-vlan {vlan} vlan {vlan}", 30, f"sp-{onu_if}-{sp_id}")
-    else:
-        to_add = [v for v in target_vlans if v not in existing_vlans]
-        next_id = (max(existing.keys()) + 1) if existing else 1
-        for vlan in to_add:
-            z.send_wait_any(f"service-port {next_id} vport 1 user-vlan {vlan} vlan {vlan}", 30, f"sp-{onu_if}-{next_id}")
-            next_id += 1
-
-    z.send_wait_any("exit", 20, f"exit-{onu_if}")
-
-# ================== TYPE PICKER ==================
-def get_available_onu_types(z: ZXAN) -> List[str]:
+# ================== RUNNING-CONFIG CACHE ==================
+def get_running_config_cached(z: ZXAN, force: bool = False) -> str:
+    global RUNCFG_CACHE
+    t0, txt = RUNCFG_CACHE
+    now = time.time()
+    if (not force) and txt and (now - t0 <= RUNCFG_CACHE_TTL_SEC):
+        return txt
     with silent(z.log):
         enter_config(z)
         out = z.send_wait_any("show running-config", SHOW_TIMEOUT, "show-running-config")
+        ensure_exec(z)
+    RUNCFG_CACHE = (now, out)
+    return out
+
+# ================== DISCOVERY ALL PORTS ==================
+def discover_root_cards_from_help(z: ZXAN) -> List[str]:
+    ensure_exec(z)
+    out = z.send_wait_any("show interface ?", SHOW_TIMEOUT, "discover-root-help")
+    roots = sorted(set(re.findall(r"\b(epon-olt_\d+/\d+)\b", out, flags=re.IGNORECASE)))
+    return [r.lower() for r in roots]
+
+def expand_ports_from_root(root: str, ports_per_card: int = 8) -> List[str]:
+    return [f"{root}/{i}" for i in range(1, ports_per_card + 1)]
+
+def count_registered_on_port(z: ZXAN, port: str) -> Tuple[int, int, int]:
+    out_deny = show_unauthentication(z, port, quiet=True)
+    deny_ids = {d.onu_no for d in parse_unauthentication_blocks(out_deny)}
+    out_pass = show_authentication(z, port, quiet=True)
+    pass_ids = {p.onu_no for p in parse_authentication_blocks(out_pass)}
+    total_ids = deny_ids.union(pass_ids)
+    return (len(total_ids), len(pass_ids), len(deny_ids))
+
+# ================== TYPE PICKER ==================
+def get_available_onu_types(z: ZXAN) -> List[str]:
+    out = get_running_config_cached(z)
     types: List[str] = []
     for line in out.splitlines():
         m = re.match(r"^\s*onu-type\s+(\S+)\s+epon\b", line, re.IGNORECASE)
@@ -428,90 +503,356 @@ def pick_type_from_model_strict(model: Optional[str], available_types: List[str]
     m = normalize_model(model)
     if not m:
         return None
-
     for t in available_types:
         if t.lower() == m.lower():
             return t
-
     contains = [t for t in available_types if m.lower() in t.lower()]
     if contains:
         contains.sort(key=lambda x: (len(x), x.lower()))
         return contains[0]
-
     suffix = [t for t in available_types if t.lower().endswith(m.lower())]
     if suffix:
         suffix.sort(key=lambda x: (len(x), x.lower()))
         return suffix[0]
-
     return None
 
-# ================== ONU ID MAPPING (V2) ==================
-MAC_TO_ONU_ID: Dict[str, int] = {}
-NEXT_ONU_ID = START_ONU_ID
+# ================== VLAN READ/WRITE (ONU) ==================
+def get_onu_service_ports(z: ZXAN, onu_if: str) -> Dict[int, int]:
+    ensure_exec(z)
+    z.send_wait_any("configure terminal", 20, "cfg-onu-sp-read")
+    z.send_wait_any(f"interface {onu_if}", 20, f"enter-{onu_if}")
+    out = z.send_wait_any("show this", SHOW_TIMEOUT, f"show-this-{onu_if}")
+    z.send_wait_any("exit", 20, f"exit-{onu_if}")
+    ensure_exec(z)
+    return parse_service_ports(out)
 
-def get_used_onu_ids(z: ZXAN, olt_if: str) -> Set[int]:
-    used: Set[int] = set()
-    out_deny = show_unauthentication(z, olt_if, quiet=True)
-    denies = parse_unauthentication_blocks(out_deny)
-    used |= {d.onu_no for d in denies}
+def set_onu_vlans(z: ZXAN, onu_if: str, vlans: List[int], mode: str = "APPEND"):
+    mode = mode.upper().strip()
+    target_vlans = uniq_int_list(vlans)
+    if not target_vlans:
+        return
 
-    out_pass = show_authentication(z, olt_if, quiet=True)
-    passed = parse_authentication_blocks(out_pass)
-    used |= {p.onu_no for p in passed}
+    existing = get_onu_service_ports(z, onu_if)
+    existing_vlans = set(existing.values())
 
-    used |= set(MAC_TO_ONU_ID.values())
-    return used
+    ensure_exec(z)
+    z.send_wait_any("configure terminal", 20, "cfg-onu-sp-write")
+    z.send_wait_any(f"interface {onu_if}", 20, f"enter-{onu_if}")
 
-def assign_onu_id_for_mac(z: ZXAN, olt_if: str, mac: str) -> int:
-    global NEXT_ONU_ID
-    mac = mac.lower()
-    if mac in MAC_TO_ONU_ID:
-        return MAC_TO_ONU_ID[mac]
+    z.send_wait_any("switch mode hybrid", 20, f"hybrid-{onu_if}")
 
-    used = get_used_onu_ids(z, olt_if)
-    candidate = max(NEXT_ONU_ID, START_ONU_ID)
+    if mode == "REPLACE":
+        for sp_id in sorted(existing.keys()):
+            z.send_wait_any(f"no service-port {sp_id}", 20, f"no-sp-{onu_if}-{sp_id}")
+        for sp_id, vlan in enumerate(target_vlans, start=1):
+            z.send_wait_any(f"service-port {sp_id} vport 1 user-vlan {vlan} vlan {vlan}", 30, f"sp-{onu_if}-{sp_id}")
+    else:
+        to_add = [v for v in target_vlans if v not in existing_vlans]
+        next_id = (max(existing.keys()) + 1) if existing else 1
+        for vlan in to_add:
+            z.send_wait_any(f"service-port {next_id} vport 1 user-vlan {vlan} vlan {vlan}", 30, f"sp-{onu_if}-{next_id}")
+            next_id += 1
 
-    while candidate in used:
-        candidate += 1
-        if candidate > MAX_ONU_ID:
-            raise RuntimeError(f"ONU ID habis. Cek range {START_ONU_ID}..{MAX_ONU_ID}")
+    z.send_wait_any("exit", 20, f"exit-{onu_if}")
+    ensure_exec(z)
 
-    MAC_TO_ONU_ID[mac] = candidate
-    NEXT_ONU_ID = candidate + 1
-    return candidate
+# ================== INTERFACE UPLINK VLAN TAG/UNTAG (FITUR BARU) ==================
+def show_interface_this(z: ZXAN, ifname: str) -> str:
+    ifname = ifname.strip()
+    if not ifname:
+        return ""
+    ensure_exec(z)
+    z.send_wait_any("configure terminal", 20, "cfg-if-show")
+    z.send_wait_any(f"interface {ifname}", 20, f"enter-if-{ifname}")
+    out = z.send_wait_any("show this", SHOW_TIMEOUT, f"show-this-{ifname}")
+    z.send_wait_any("exit", 20, f"exit-if-{ifname}")
+    ensure_exec(z)
+    return out
 
-# ================== PROVISION CORE (MAC-driven + fixed ONU-ID) ==================
-def get_denies_by_mac(z: ZXAN, olt_if: str) -> Dict[str, OnuDeny]:
-    out = show_unauthentication(z, olt_if, quiet=True)
-    denies = parse_unauthentication_blocks(out)
-    mp: Dict[str, OnuDeny] = {}
-    for d in denies:
-        if d.mac:
-            mp[d.mac.lower()] = d
-    return mp
+def parse_switchport_vlan_lines(text: str) -> Dict[str, Set[int]]:
+    """
+    Ambil VLAN dari:
+      switchport vlan <range> tag
+      switchport vlan <range> untag
+    """
+    res = {"tag": set(), "untag": set()}
+    for line in text.splitlines():
+        m = re.search(r"switchport\s+vlan\s+([0-9,\-\s]+)\s+(tag|untag)\b", line, re.IGNORECASE)
+        if not m:
+            continue
+        rng = m.group(1).strip().replace(" ", "")
+        mode = m.group(2).lower()
+        vl = parse_csv_ints(rng)
+        res.setdefault(mode, set()).update(vl)
+    return res
 
-def is_mac_in_pass(z: ZXAN, olt_if: str, mac: str) -> bool:
+def apply_switchport_vlan_update(
+    z: ZXAN,
+    ifname: str,
+    vlans: List[int],
+    action: str = "APPEND",
+    tagmode: str = "tag"
+):
+    """
+    action: APPEND | REMOVE | REPLACE
+    tagmode: tag | untag
+    """
+    action = action.upper().strip()
+    tagmode = tagmode.lower().strip()
+    if tagmode not in ("tag", "untag"):
+        raise ValueError("tagmode harus 'tag' atau 'untag'")
+    target = uniq_int_list(vlans)
+    if not target:
+        print("VLAN kosong.")
+        return
+
+    # ambil existing dari show this interface
+    out_this = show_interface_this(z, ifname)
+    existing = parse_switchport_vlan_lines(out_this).get(tagmode, set())
+
+    ensure_exec(z)
+    z.send_wait_any("configure terminal", 20, "cfg-if-vlan")
+    z.send_wait_any(f"interface {ifname}", 20, f"enter-if-{ifname}")
+
+    def run_cmd(cmd: str, label: str, t: int = 30) -> str:
+        return z.send_wait_any(cmd, t, label)
+
+    if action == "APPEND":
+        to_add = [v for v in target if v not in existing]
+        if not to_add:
+            print("Tidak ada VLAN baru untuk ditambahkan (sudah ada).")
+        else:
+            for rng in chunk_vlan_cmd_ranges(to_add):
+                out = run_cmd(f"switchport vlan {rng} {tagmode}", f"if-add-{ifname}-{tagmode}")
+                if looks_like_error(out):
+                    print("   -> ERROR tambah VLAN:")
+                    print(extract_error_snippet(out))
+
+    elif action == "REMOVE":
+        to_del = [v for v in target if v in existing]
+        if not to_del:
+            print("Tidak ada VLAN yang cocok untuk dihapus (tidak ditemukan di interface).")
+        else:
+            for rng in chunk_vlan_cmd_ranges(to_del):
+                out = run_cmd(f"no switchport vlan {rng} {tagmode}", f"if-del-{ifname}-{tagmode}")
+                if looks_like_error(out):
+                    print("   -> ERROR hapus VLAN:")
+                    print(extract_error_snippet(out))
+
+    elif action == "REPLACE":
+        # 1) clear existing tagmode
+        if existing:
+            # coba cara cepat: "no switchport vlan all <tagmode>"
+            out = run_cmd(f"no switchport vlan all {tagmode}", f"if-clear-all-{ifname}-{tagmode}")
+            if looks_like_error(out):
+                # fallback: hapus per-range existing
+                for rng in chunk_vlan_cmd_ranges(sorted(existing)):
+                    out2 = run_cmd(f"no switchport vlan {rng} {tagmode}", f"if-clear-{ifname}-{tagmode}")
+                    if looks_like_error(out2):
+                        print("   -> ERROR clear VLAN (fallback):")
+                        print(extract_error_snippet(out2))
+
+        # 2) add target
+        for rng in chunk_vlan_cmd_ranges(target):
+            out = run_cmd(f"switchport vlan {rng} {tagmode}", f"if-replace-add-{ifname}-{tagmode}")
+            if looks_like_error(out):
+                print("   -> ERROR replace add VLAN:")
+                print(extract_error_snippet(out))
+
+    else:
+        z.send_wait_any("exit", 20, f"exit-if-{ifname}")
+        ensure_exec(z)
+        raise ValueError("action harus APPEND/REMOVE/REPLACE")
+
+    z.send_wait_any("exit", 20, f"exit-if-{ifname}")
+    ensure_exec(z)
+
+# ===== Interface discovery (XGE/GE, dll) =====
+def list_uplink_interfaces_from_runningcfg(runcfg: str) -> List[str]:
+    """
+    Ambil daftar interface yang umum dipakai uplink:
+      gei_*, xgei_*, xe*, gi* (sesuai yang muncul)
+    """
+    ifnames = []
+    for line in runcfg.splitlines():
+        m = re.match(r"^\s*interface\s+(\S+)\s*$", line, re.IGNORECASE)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        # filter uplink-ish
+        if re.match(r"^(xgei_|gei_|xe|xg|gi|g|eth)\b", name, re.IGNORECASE):
+            ifnames.append(name)
+    # uniq preserve order
+    seen = set()
+    out = []
+    for n in ifnames:
+        k = n.lower()
+        if k not in seen:
+            out.append(n)
+            seen.add(k)
+    return out
+
+# ================== VLAN DATABASE (FITUR BARU) ==================
+def parse_vlan_database_from_runningcfg(runcfg: str) -> Set[int]:
+    """
+    Parse block:
+      vlan database
+        vlan 1-2000,4091-4092
+        vlan 4094
+    """
+    vlans: Set[int] = set()
+    # ambil block vlan database
+    m = re.search(r"\nvlan\s+database\s*\n(.*?)(?=\n!\s*\n|\n\w)", runcfg, re.IGNORECASE | re.DOTALL)
+    if not m:
+        # fallback: cari sampai ketemu baris tidak indent
+        lines = runcfg.splitlines()
+        in_db = False
+        for ln in lines:
+            if re.match(r"^\s*vlan\s+database\s*$", ln, re.IGNORECASE):
+                in_db = True
+                continue
+            if in_db:
+                if re.match(r"^\S", ln):  # keluar saat non-indent
+                    break
+                mm = re.search(r"^\s*vlan\s+([0-9,\-\s]+)\s*$", ln, re.IGNORECASE)
+                if mm:
+                    vlans.update(parse_csv_ints(mm.group(1).replace(" ", "")))
+        return vlans
+
+    block = m.group(1)
+    for ln in block.splitlines():
+        mm = re.search(r"^\s*vlan\s+([0-9,\-\s]+)\s*$", ln, re.IGNORECASE)
+        if mm:
+            vlans.update(parse_csv_ints(mm.group(1).replace(" ", "")))
+    return vlans
+
+def apply_vlan_database_update(z: ZXAN, vlans: List[int], action: str = "ADD"):
+    """
+    action: ADD | REMOVE
+    """
+    action = action.upper().strip()
+    target = uniq_int_list(vlans)
+    if not target:
+        print("VLAN kosong.")
+        return
+
+    ensure_exec(z)
+    z.send_wait_any("configure terminal", 20, "cfg-vlan-db")
+    out = z.send_wait_any("vlan database", 20, "enter-vlan-db")
+
+    # jalankan per-chunk agar aman
+    if action == "ADD":
+        for rng in chunk_vlan_cmd_ranges(target):
+            out2 = z.send_wait_any(f"vlan {rng}", 30, f"vlan-db-add-{rng}")
+            if looks_like_error(out2):
+                print("   -> ERROR add vlan db:")
+                print(extract_error_snippet(out2))
+    elif action == "REMOVE":
+        for rng in chunk_vlan_cmd_ranges(target):
+            out2 = z.send_wait_any(f"no vlan {rng}", 30, f"vlan-db-del-{rng}")
+            if looks_like_error(out2):
+                print("   -> ERROR del vlan db:")
+                print(extract_error_snippet(out2))
+    else:
+        z.send_wait_any("exit", 20, "exit-vlan-db")
+        ensure_exec(z)
+        raise ValueError("action harus ADD/REMOVE")
+
+    z.send_wait_any("exit", 20, "exit-vlan-db")
+    ensure_exec(z)
+
+def extract_all_referenced_vlans_from_runningcfg(runcfg: str) -> Set[int]:
+    """
+    Fitur AUTO-SYNC:
+    - ambil VLAN dari switchport vlan ... tag/untag
+    - ambil VLAN dari service-port ... vlan X
+    - tambah DEFAULT_VLANS
+    """
+    v: Set[int] = set(DEFAULT_VLANS)
+
+    # switchport vlan <range> (tag|untag)
+    for m in re.finditer(r"switchport\s+vlan\s+([0-9,\-\s]+)\s+(?:tag|untag)\b", runcfg, re.IGNORECASE):
+        rng = m.group(1).replace(" ", "")
+        v.update(parse_csv_ints(rng))
+
+    # service-port ... vlan <id>
+    for m in re.finditer(r"\bservice-port\s+\d+.*?\bvlan\s+(\d+)\b", runcfg, re.IGNORECASE):
+        try:
+            v.add(int(m.group(1)))
+        except Exception:
+            pass
+
+    # filter valid VLAN ID umum (1..4094)
+    v = {x for x in v if 1 <= int(x) <= 4094}
+    return v
+
+def vlan_db_autosync(z: ZXAN):
+    runcfg = get_running_config_cached(z, force=True)
+    db_now = parse_vlan_database_from_runningcfg(runcfg)
+    need = extract_all_referenced_vlans_from_runningcfg(runcfg)
+    missing = sorted(need - db_now)
+
+    print("\n=== VLAN DB AUTO-SYNC ===")
+    print(f"VLAN referenced (need): {len(need)}")
+    print(f"VLAN in database now:   {len(db_now)}")
+    print(f"Missing VLAN to add:    {len(missing)}")
+    if missing:
+        show = missing[:60]
+        print(f"Missing sample: {show}{' ...' if len(missing) > 60 else ''}")
+
+    if not missing:
+        print("Tidak ada VLAN yang perlu ditambahkan. Sudah sinkron.")
+        return
+
+    confirm = input("Ketik SYNC untuk tambah semua VLAN missing ke VLAN database: ").strip()
+    if confirm != "SYNC":
+        print("Batal.")
+        return
+
+    apply_vlan_database_update(z, missing, action="ADD")
+    wr_after_each(z, note="VLANDB AUTOSYNC")
+    print("AUTO-SYNC selesai + WR.")
+
+# ================== PROVISION / RENUNBER PORT ==================
+def get_pass_list(z: ZXAN, olt_if: str) -> List[OnuPass]:
     out = show_authentication(z, olt_if, quiet=True)
-    passed = parse_authentication_blocks(out)
-    m = mac.lower()
-    return any((p.mgmt_mac or "").lower() == m for p in passed)
+    return parse_authentication_blocks(out)
+
+def get_deny_list(z: ZXAN, olt_if: str) -> List[OnuDeny]:
+    out = show_unauthentication(z, olt_if, quiet=True)
+    return parse_unauthentication_blocks(out)
+
+def fast_verify_mac_state(z: ZXAN, olt_if: str, mac: str) -> Tuple[bool, bool]:
+    mac = mac.lower()
+    t_end = time.time() + VERIFY_MAX_WAIT_SEC
+    while True:
+        denies = {d.mac.lower(): d for d in get_deny_list(z, olt_if) if d.mac}
+        if mac not in denies:
+            passed = get_pass_list(z, olt_if)
+            ok_pass = any((p.mgmt_mac or "").lower() == mac for p in passed)
+            return True, ok_pass
+        if time.time() >= t_end:
+            return False, False
+        time.sleep(VERIFY_POLL_INTERVAL_SEC)
 
 def rollback_onu_id(z: ZXAN, olt_if: str, onu_no: int, onu_prefix: str):
     try:
         enter_olt(z, olt_if)
         z.send_wait_any(f"no onu {onu_no}", 30, f"rollback-no-onu-{onu_no}")
         z.send_wait_any("exit", 20, "rollback-exit-olt")
+        ensure_exec(z)
     except Exception:
         pass
 
     onu_if = f"{onu_prefix}{onu_no}"
     try:
-        go_exec(z)
+        ensure_exec(z)
         z.send_wait_any("configure terminal", 20, "rollback-cfg-onu")
         z.send_wait_any(f"interface {onu_if}", 20, f"rollback-enter-{onu_if}")
         z.send_wait_any("deregister", 20, f"rollback-deregister-{onu_if}")
         z.send_wait_any("deactivate", 20, f"rollback-deactivate-{onu_if}")
         z.send_wait_any("exit", 20, f"rollback-exit-{onu_if}")
+        ensure_exec(z)
     except Exception:
         pass
 
@@ -519,77 +860,170 @@ def try_add_onu_with_type(z: ZXAN, olt_if: str, onu_no: int, onu_type: str, mac:
     enter_olt(z, olt_if)
     out = z.send_wait_any(f"onu {onu_no} type {onu_type} mac {mac} ip-cfg static", 60, f"add-onu-{onu_no}-{onu_type}")
     z.send_wait_any("exit", 20, "exit-olt")
+    ensure_exec(z)
     return (not looks_like_error(out), out)
 
 def apply_universal_onu_config(z: ZXAN, onu_if: str, vlans: List[int]):
-    go_exec(z)
+    ensure_exec(z)
     z.send_wait_any("configure terminal", 20, "cfg-onu-template")
     z.send_wait_any(f"interface {onu_if}", 20, f"enter-{onu_if}")
 
-    for cmd in [
-        "ems-autocfg-request disable",
-        "encrypt direction downstream  enable  vport 1",
-    ]:
-        out = z.send_wait_any(cmd, 20, f"tmpl-{onu_if}")
-        if looks_like_error(out):
-            print(f"   -> WARN CONFIG gagal: '{cmd}'")
-            print(extract_error_snippet(out))
+    z.send_wait_any("switch mode hybrid", 20, f"hybrid-{onu_if}")
+    z.send_wait_any("encrypt direction downstream  enable  vport 1", 20, f"enc-{onu_if}")
 
     for sp_id, vlan in enumerate(uniq_int_list(vlans), start=1):
-        out = z.send_wait_any(f"service-port {sp_id} vport 1 user-vlan {vlan} vlan {vlan}", 30, f"sp-{onu_if}-{sp_id}")
-        if looks_like_error(out):
-            print(f"   -> WARN SERVICE-PORT gagal: vlan={vlan} (sp_id={sp_id})")
-            print(extract_error_snippet(out))
+        z.send_wait_any(f"service-port {sp_id} vport 1 user-vlan {vlan} vlan {vlan}", 30, f"sp-{onu_if}-{sp_id}")
 
     z.send_wait_any("exit", 20, f"exit-{onu_if}")
+    ensure_exec(z)
 
-def provision_mac_v2(z: ZXAN, olt_if: str, onu_prefix: str, mac: str, model_hint: Optional[str], available_types: List[str]) -> bool:
-    mac = mac.lower()
+@dataclass
+class RenumItem:
+    mac: str
+    old_id: int
+    new_id: int
+    onu_type: str
+    model: str
+    state: str  # PASS/DENY
 
-    denies_map = get_denies_by_mac(z, olt_if)
-    if mac not in denies_map:
-        if is_mac_in_pass(z, olt_if, mac):
-            print(f" - MAC {mac} sudah PASS (skip).")
-            return True
-        print(f" - MAC {mac} tidak ada di DENY saat ini (skip).")
-        return True
+def build_port_sequential_plan(
+    passed: List[OnuPass],
+    denied: List[OnuDeny],
+    available_types: List[str]
+) -> List[RenumItem]:
+    tmp: List[Tuple[int, RenumItem]] = []
 
-    model = denies_map[mac].model or model_hint or "-"
+    for p in passed:
+        mac = (p.mgmt_mac or "").lower()
+        if not mac:
+            continue
+        t = (p.onu_type or "").strip()
+        if not t:
+            raise RuntimeError(f"TYPE kosong untuk PASS ONU {p.onu_no} mac={mac}")
+        tmp.append((p.onu_no, RenumItem(mac=mac, old_id=p.onu_no, new_id=0, onu_type=t, model="-", state="PASS")))
 
-    t = pick_type_from_model_strict(model, available_types)
-    if not t and DEFAULT_ONU_TYPE:
-        if any(x.lower() == DEFAULT_ONU_TYPE.lower() for x in available_types):
-            t = next(x for x in available_types if x.lower() == DEFAULT_ONU_TYPE.lower())
+    for d in denied:
+        mac = (d.mac or "").lower()
+        if not mac:
+            continue
+        model = d.model or "-"
+        t = pick_type_from_model_strict(model, available_types)
+        if (not t) and DEFAULT_ONU_TYPE:
+            if any(x.lower() == DEFAULT_ONU_TYPE.lower() for x in available_types):
+                t = next(x for x in available_types if x.lower() == DEFAULT_ONU_TYPE.lower())
+        if not t:
+            raise RuntimeError(f"TYPE tidak ditemukan untuk DENY mac={mac} model={model}")
+        tmp.append((d.onu_no, RenumItem(mac=mac, old_id=d.onu_no, new_id=0, onu_type=t, model=model, state="DENY")))
 
-    if not t:
-        print(f" - MAC {mac} | MODEL {model}")
-        print("   -> TYPE cocok tidak ditemukan. Buat onu-type via menu 13.")
-        return False
+    tmp.sort(key=lambda x: x[0])
 
-    onu_id = assign_onu_id_for_mac(z, olt_if, mac)
-    onu_if = f"{onu_prefix}{onu_id}"
+    plan: List[RenumItem] = []
+    new_id = START_ONU_ID
+    for _, item in tmp:
+        item.new_id = new_id
+        plan.append(item)
+        new_id += 1
+        if new_id > MAX_ONU_ID + 1:
+            raise RuntimeError(f"ONU ID melebihi range {START_ONU_ID}..{MAX_ONU_ID}")
+    return plan
 
-    print(f" - MAC {mac} | MODEL {model} | TYPE {t} | ONU_ID {onu_id}")
+def apply_plan_sequential_port(z: ZXAN, olt_if: str, onu_prefix: str, plan: List[RenumItem]) -> Tuple[int, int]:
+    ok = 0
+    total = len(plan)
+    for it in plan:
+        onu_if_new = f"{onu_prefix}{it.new_id}"
+        print(f" - [{it.state}] {it.mac} | {it.onu_type} | OLD {it.old_id} -> NEW {it.new_id}")
 
-    rollback_onu_id(z, olt_if, onu_id, onu_prefix)
+        rollback_onu_id(z, olt_if, it.old_id, onu_prefix)
+        if it.new_id != it.old_id:
+            rollback_onu_id(z, olt_if, it.new_id, onu_prefix)
 
-    ok_add, add_out = try_add_onu_with_type(z, olt_if, onu_id, t, mac)
-    if not ok_add:
-        print(f"   -> ADD GAGAL type={t} onu_id={onu_id}")
-        print(extract_error_snippet(add_out))
-        return False
+        ok_add, add_out = try_add_onu_with_type(z, olt_if, it.new_id, it.onu_type, it.mac)
+        if not ok_add:
+            print(f"   -> ADD GAGAL: {it.mac} new_id={it.new_id}")
+            print(extract_error_snippet(add_out))
+            continue
 
-    apply_universal_onu_config(z, onu_if, DEFAULT_VLANS)
-    time.sleep(VERIFY_DELAY_SEC)
+        apply_universal_onu_config(z, onu_if_new, DEFAULT_VLANS)
 
-    denies_map2 = get_denies_by_mac(z, olt_if)
-    if mac not in denies_map2:
-        passed = is_mac_in_pass(z, olt_if, mac)
-        print(f"   -> SUKSES: MAC keluar dari DENY" + (" & PASS terdeteksi" if passed else ""))
-        return True
+        cleared, _ = fast_verify_mac_state(z, olt_if, it.mac)
+        if cleared:
+            ok += 1
+            wr_after_each(z, note=f"{onu_if_new}")
+        else:
+            print(f"   -> BELUM STABLE: {it.mac}")
 
-    print(f"   -> MASIH DENY: MAC masih muncul.")
-    return False
+    return ok, total
+
+# ================== SEARCH MAC (SEMUA PORT) ==================
+def search_macs_on_port(z: ZXAN, port: str, queries: List[str]) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+
+    out_deny = show_unauthentication(z, port, quiet=True)
+    denies = parse_unauthentication_blocks(out_deny)
+    for d in denies:
+        fm = (d.mac or "").lower()
+        if not fm:
+            continue
+        for q in queries:
+            if mac_match(fm, q):
+                results.append({"query": q, "mac": fm, "status": "DENY", "port": port, "onu_id": str(d.onu_no),
+                                "type": "-", "model": d.model or "-"})
+                break
+
+    out_pass = show_authentication(z, port, quiet=True)
+    passed = parse_authentication_blocks(out_pass)
+    for p in passed:
+        fm = (p.mgmt_mac or "").lower()
+        if not fm:
+            continue
+        for q in queries:
+            if mac_match(fm, q):
+                results.append({"query": q, "mac": fm, "status": "PASS", "port": port, "onu_id": str(p.onu_no),
+                                "type": p.onu_type or "-", "model": "-"})
+                break
+
+    return results
+
+def search_macs_all_ports(z: ZXAN, queries: List[str]) -> List[Dict[str, str]]:
+    all_results: List[Dict[str, str]] = []
+    with silent(z.log):
+        roots = discover_root_cards_from_help(z)
+        ports: List[str] = []
+        for r0 in roots:
+            ports.extend(expand_ports_from_root(r0, ports_per_card=8))
+
+    for p in ports:
+        res = search_macs_on_port(z, p, queries)
+        if res:
+            all_results.extend(res)
+
+    def keyfn(x):
+        try:
+            onu = int(x.get("onu_id", "0"))
+        except Exception:
+            onu = 0
+        return (x.get("query", ""), x.get("port", ""), onu, x.get("mac", ""))
+    all_results.sort(key=keyfn)
+    return all_results
+
+def print_search_results(queries: List[str], results: List[Dict[str, str]]):
+    print("\n=== HASIL SEARCH MAC (SEMUA PORT) ===")
+    if not results:
+        for q in queries:
+            print(f"\n[QUERY {q}] NOT FOUND")
+        return
+    byq: Dict[str, List[Dict[str, str]]] = {}
+    for r in results:
+        byq.setdefault(r["query"], []).append(r)
+    for q in queries:
+        rows = byq.get(q, [])
+        if not rows:
+            print(f"\n[QUERY {q}] NOT FOUND")
+            continue
+        print(f"\n[QUERY {q}] FOUND {len(rows)}")
+        for r in rows:
+            print(f"- MAC {r['mac']} | {r['status']} | PORT {r['port']} | ONU_ID {r['onu_id']} | TYPE {r['type']} | MODEL {r['model']}")
 
 # ================== DELETE ALL ONU (PORT) ==================
 def get_all_onu_ids_on_port(z: ZXAN, olt_if: str) -> List[int]:
@@ -606,35 +1040,28 @@ def delete_onu_ids(z: ZXAN, olt_if: str, ids: List[int]):
     for onu_no in ids:
         z.send_wait_any(f"no onu {onu_no}", 30, f"no-onu-{onu_no}")
     z.send_wait_any("exit", 20, "exit-olt-delete")
+    ensure_exec(z)
 
-# ================== MENU 17: REBOOT ONU ==================
+# ================== REBOOT ONU ==================
 def reboot_onu(z: ZXAN, onu_if: str) -> bool:
-    """
-    Sesuai contoh:
-      config t
-      pon-onu
-      pon-onu-mng epon-onu_1/2/5:5
-      reboot
-    """
     onu_if = onu_if.strip()
     if not onu_if:
         return False
 
-    go_exec(z)
+    ensure_exec(z)
     z.send_wait_any("configure terminal", 20, "reboot-cfg")
     z.send_wait_any("pon-onu", 20, "reboot-pon-onu")
     z.send_wait_any(f"pon-onu-mng {onu_if}", 20, f"reboot-mng-{onu_if}")
     out = z.send_wait_any("reboot", 60, f"reboot-{onu_if}")
 
-    # keluar dari mode mng -> pon-onu -> config
     z.send_wait_any("exit", 20, f"reboot-exit-mng-{onu_if}")
     z.send_wait_any("exit", 20, f"reboot-exit-pon-onu-{onu_if}")
+    ensure_exec(z)
 
     if looks_like_error(out):
         print(f"   -> REBOOT GAGAL: {onu_if}")
         print(extract_error_snippet(out))
         return False
-
     print(f"   -> REBOOT OK: {onu_if}")
     return True
 
@@ -683,8 +1110,7 @@ def reboot_all_on_current_card(z: ZXAN, current_olt_if: str):
         return
 
     ports = [f"{root}/{i}" for i in range(1, 9)]
-    # hitung total dulu biar jelas
-    port_map: Dict[str, Tuple[str, List[int]]] = {}  # port -> (onu_prefix, ids)
+    port_map: Dict[str, Tuple[str, List[int]]] = {}
     total = 0
     for p in ports:
         pref = onu_prefix_from_olt_port(p) or ""
@@ -698,7 +1124,7 @@ def reboot_all_on_current_card(z: ZXAN, current_olt_if: str):
         return
 
     print("\nReboot SEMUA ONU di CARD ini:")
-    for p, (pref, ids) in port_map.items():
+    for p, (_, ids) in port_map.items():
         print(f" - {p}: total={len(ids)} | IDs={ids}")
 
     confirm = input(f"Ketik REBOOTCARD untuk lanjut reboot total {total} ONU: ").strip()
@@ -706,8 +1132,7 @@ def reboot_all_on_current_card(z: ZXAN, current_olt_if: str):
         print("Batal.")
         return
 
-    ok = 0
-    done = 0
+    ok = done = 0
     for p, (pref, ids) in port_map.items():
         print(f"\n[PORT {p}] reboot {len(ids)} ONU ...")
         for onu_no in ids:
@@ -718,7 +1143,7 @@ def reboot_all_on_current_card(z: ZXAN, current_olt_if: str):
             time.sleep(0.2)
     print(f"\nSelesai reboot card. OK={ok}/{done}")
 
-# ================== MENU 16: 2 TAHAP ==================
+# ================== MENU 16: PRINT CARD (2 tahap) ==================
 def print_card_quick(z: ZXAN, current_olt_if: str):
     root = olt_root_from_port(current_olt_if)
     if not root:
@@ -739,17 +1164,15 @@ def print_card_quick(z: ZXAN, current_olt_if: str):
         if total == 0:
             continue
 
-        onu_prefix = onu_prefix_from_olt_port(port) or ""
-        all_prefix[port] = onu_prefix
+        pref = onu_prefix_from_olt_port(port) or ""
+        all_prefix[port] = pref
         all_pass[port] = passed
 
         print(f"\n--- PORT {port} | PASS {len(passed)} | DENY {len(denies)} ---")
-
         if passed:
-            print("PASS (tanpa TX/RX):")
+            print("PASS:")
             for p in passed:
                 print(f" - ONU {p.onu_no} | TYPE {p.onu_type or '-'} | MgmtMAC {p.mgmt_mac or '-'} | LastAuth {p.last_auth_time or '-'}")
-
         if denies:
             print("DENY:")
             for d in denies:
@@ -762,32 +1185,14 @@ def print_card_optic(z: ZXAN, all_pass: Dict[str, List[OnuPass]], all_prefix: Di
     for port, passed in all_pass.items():
         if not passed:
             continue
-        onu_prefix = all_prefix.get(port, "")
+        pref = all_prefix.get(port, "")
         print(f"\n--- PORT {port} | PASS {len(passed)} (TX/RX) ---")
         for p in passed:
-            onu_if = f"{onu_prefix}{p.onu_no}"
+            onu_if = f"{pref}{p.onu_no}"
             optic = get_onu_optic_cached(z, onu_if)
             tx = f"{optic.onu_tx_up_dbm:.3f} dBm" if optic.onu_tx_up_dbm is not None else "-"
             rx = f"{optic.onu_rx_down_dbm:.3f} dBm" if optic.onu_rx_down_dbm is not None else "-"
             print(f" - ONU {p.onu_no} | TYPE {p.onu_type or '-'} | TX {tx} | RX {rx}")
-
-# ================== MENU 9 COUNT ALL PORTS ==================
-def discover_root_cards_from_help(z: ZXAN) -> List[str]:
-    go_exec(z)
-    out = z.send_wait_any("show interface ?", SHOW_TIMEOUT, "discover-root-help")
-    roots = sorted(set(re.findall(r"\b(epon-olt_\d+/\d+)\b", out, flags=re.IGNORECASE)))
-    return [r.lower() for r in roots]
-
-def expand_ports_from_root(root: str, ports_per_card: int = 8) -> List[str]:
-    return [f"{root}/{i}" for i in range(1, ports_per_card + 1)]
-
-def count_registered_on_port(z: ZXAN, port: str) -> Tuple[int, int, int]:
-    out_deny = show_unauthentication(z, port, quiet=True)
-    deny_ids = {d.onu_no for d in parse_unauthentication_blocks(out_deny)}
-    out_pass = show_authentication(z, port, quiet=True)
-    pass_ids = {p.onu_no for p in parse_authentication_blocks(out_pass)}
-    total_ids = deny_ids.union(pass_ids)
-    return (len(total_ids), len(pass_ids), len(deny_ids))
 
 # ================== MODE 13 TYPE ==================
 def add_onu_type_epon(z: ZXAN, onu_type: str, eth_ports: int, wifi_ssids: int, voip_ports: int):
@@ -808,6 +1213,8 @@ def add_onu_type_epon(z: ZXAN, onu_type: str, eth_ports: int, wifi_ssids: int, v
     for i in range(1, voip_ports + 1):
         z.send_wait_any(f"onu-type-if {onu_type} pots_0/{i}", 20, f"typeif-pots-{onu_type}-{i}")
     z.send_wait_any("exit", 20, "exit-pon")
+    ensure_exec(z)
+    wr_after_each(z, note=f"ADD TYPE {onu_type}")
 
 def mode_type_menu(z: ZXAN, olt_if: str, available_types: List[str]) -> List[str]:
     global DEFAULT_ONU_TYPE
@@ -864,7 +1271,7 @@ def mode_type_menu(z: ZXAN, olt_if: str, available_types: List[str]) -> List[str
                 print("Batal.")
                 continue
             delete_onu_ids(z, olt_if, to_del)
-            end_wr(z)
+            wr_after_each(z, note=f"DEL TYPE {target}")
             print("Delete by TYPE selesai + WR.")
             continue
 
@@ -880,18 +1287,190 @@ def mode_type_menu(z: ZXAN, olt_if: str, available_types: List[str]) -> List[str
             except Exception:
                 print("Input angka tidak valid.")
                 continue
-            print("\nAkan buat ONU TYPE dengan setting:")
-            print(f" - TYPE: {onu_type}")
-            print(f" - ETH: {eth_ports} | WIFI SSIDs: {wifi_ssids} | VoIP: {voip_ports}")
             confirm = input("Ketik YES untuk lanjut: ").strip()
             if confirm != "YES":
                 print("Batal.")
                 continue
             add_onu_type_epon(z, onu_type, eth_ports, wifi_ssids, voip_ports)
-            end_wr(z)
-            print("Tambah ONU TYPE selesai + WR.")
             print("Refresh daftar TYPE...")
             available_types = get_available_onu_types(z)
+            continue
+
+        print("Pilihan tidak dikenal.")
+
+# ================== MENU 18: UPDATE VLAN PASS DI CARD ==================
+def get_pass_ids_on_port(z: ZXAN, port: str) -> List[int]:
+    out = show_authentication(z, port, quiet=True)
+    passed = parse_authentication_blocks(out)
+    ids = [p.onu_no for p in passed]
+    return sorted(set(ids))
+
+def update_vlan_all_pass_on_card(z: ZXAN, current_olt_if: str, vlans: List[int], mode: str):
+    root = olt_root_from_port(current_olt_if)
+    if not root:
+        print("Gagal deteksi root card dari port aktif.")
+        return
+
+    ports = [f"{root}/{i}" for i in range(1, 9)]
+    total = 0
+    targets: List[Tuple[str, str, List[int]]] = []
+    for p in ports:
+        pref = onu_prefix_from_olt_port(p) or ""
+        ids = get_pass_ids_on_port(z, p)
+        if ids:
+            targets.append((p, pref, ids))
+            total += len(ids)
+
+    if total == 0:
+        print("Tidak ada ONU PASS pada card ini.")
+        return
+
+    print("\n=== UPDATE VLAN SEMUA ONU PASS DI CARD AKTIF ===")
+    print(f"Root: {root}")
+    print(f"Mode: {mode} | VLAN: {uniq_int_list(vlans)}")
+    for p, _, ids in targets:
+        print(f" - {p}: PASS {len(ids)}")
+
+    confirm = input("Ketik UPDATEPASSCARD untuk lanjut: ").strip()
+    if confirm != "UPDATEPASSCARD":
+        print("Batal.")
+        return
+
+    done = ok = 0
+    for p, pref, ids in targets:
+        print(f"\n[PORT {p}] update VLAN PASS {len(ids)} ONU ...")
+        for onu_no in ids:
+            onu_if = f"{pref}{onu_no}"
+            print(f" - {onu_if} => {mode} {uniq_int_list(vlans)}")
+            try:
+                set_onu_vlans(z, onu_if, vlans, mode=mode)
+                wr_after_each(z, note=f"VLAN {onu_if}")
+                ok += 1
+            except Exception as e:
+                print(f"   -> GAGAL: {onu_if} | {e}")
+            done += 1
+    print(f"\nSelesai UPDATEPASSCARD VLAN. OK={ok}/{done}")
+
+# ================== MENU 19: UPLINK VLAN TAG MANAGER (BARU) ==================
+def menu_uplink_vlan(z: ZXAN):
+    runcfg = get_running_config_cached(z)
+    ifs = list_uplink_interfaces_from_runningcfg(runcfg)
+    print("\n=== UPLINK INTERFACE LIST (sample) ===")
+    if ifs:
+        print("Contoh interface terdeteksi:")
+        for n in ifs[:20]:
+            print(f" - {n}")
+        if len(ifs) > 20:
+            print(f" ... (+{len(ifs)-20} lainnya)")
+    else:
+        print("Tidak ada interface uplink terdeteksi dari running-config (kamu tetap bisa input manual).")
+
+    ifname = input("\nMasukkan interface (cth: xgei_1/20/2): ").strip()
+    if not ifname:
+        print("Batal.")
+        return
+
+    while True:
+        print(f"\n=== VLAN TAG MANAGER: {ifname} ===")
+        print("1) Show config interface (show this)")
+        print("2) APPEND VLAN (tag/untag)")
+        print("3) REMOVE VLAN (tag/untag)")
+        print("4) REPLACE VLAN (tag/untag)")
+        print("0) Kembali")
+        ch = input("Pilih: ").strip()
+
+        if ch == "0":
+            return
+
+        if ch == "1":
+            out = show_interface_this(z, ifname)
+            print("\n--- SHOW THIS ---")
+            print(out)
+            parsed = parse_switchport_vlan_lines(out)
+            print("\n--- PARSED VLAN ---")
+            print(f"TAG  : {compress_ranges(sorted(parsed.get('tag', set())))}")
+            print(f"UNTAG: {compress_ranges(sorted(parsed.get('untag', set())))}")
+            continue
+
+        if ch in ("2", "3", "4"):
+            vlan_s = input("Masukkan VLAN (cth 1,18,39,52,111-255): ").strip()
+            vlans = parse_csv_ints(vlan_s)
+            if not vlans:
+                print("VLAN kosong.")
+                continue
+            tagmode = input("Mode tag atau untag? [tag/untag] (default=tag): ").strip().lower() or "tag"
+            action = {"2": "APPEND", "3": "REMOVE", "4": "REPLACE"}[ch]
+
+            print(f"\nTARGET: if={ifname} action={action} {tagmode} vlans={compress_ranges(vlans)}")
+            confirm = input("Ketik YES untuk lanjut: ").strip()
+            if confirm != "YES":
+                print("Batal.")
+                continue
+
+            apply_switchport_vlan_update(z, ifname, vlans, action=action, tagmode=tagmode)
+            wr_after_each(z, note=f"IF {ifname} {action} {tagmode}")
+            print("Selesai + WR.")
+            continue
+
+        print("Pilihan tidak dikenal.")
+
+# ================== MENU 20: VLAN DATABASE MANAGER (BARU) ==================
+def menu_vlan_database(z: ZXAN):
+    runcfg = get_running_config_cached(z, force=True)
+    db = parse_vlan_database_from_runningcfg(runcfg)
+    print("\n=== VLAN DATABASE (parsed) ===")
+    if db:
+        print(f"Total VLAN di DB: {len(db)}")
+        print(f"Range: {compress_ranges(sorted(db))[:200]}{' ...' if len(compress_ranges(sorted(db))) > 200 else ''}")
+    else:
+        print("VLAN database tidak ter-parse (atau kosong). Kamu masih bisa ADD/REMOVE.")
+
+    while True:
+        print("\n=== VLAN DATABASE MENU ===")
+        print("1) ADD VLAN ke VLAN database")
+        print("2) REMOVE VLAN dari VLAN database")
+        print("3) AUTO-SYNC VLAN database (ambil VLAN dari config + DEFAULT_VLANS, lalu ADD yang missing) + WR")
+        print("4) Refresh tampilkan VLAN database (parse running-config)")
+        print("0) Kembali")
+        ch = input("Pilih: ").strip()
+
+        if ch == "0":
+            return
+
+        if ch == "4":
+            runcfg = get_running_config_cached(z, force=True)
+            db = parse_vlan_database_from_runningcfg(runcfg)
+            print("\n=== VLAN DATABASE (parsed) ===")
+            if db:
+                print(f"Total VLAN di DB: {len(db)}")
+                rr = compress_ranges(sorted(db))
+                print(f"Range: {rr[:200]}{' ...' if len(rr) > 200 else ''}")
+            else:
+                print("VLAN database tidak ter-parse (atau kosong).")
+            continue
+
+        if ch == "3":
+            vlan_db_autosync(z)
+            runcfg = get_running_config_cached(z, force=True)
+            db = parse_vlan_database_from_runningcfg(runcfg)
+            continue
+
+        if ch in ("1", "2"):
+            vlan_s = input("Masukkan VLAN (cth 52 / 1,18,52,111-255): ").strip()
+            vlans = parse_csv_ints(vlan_s)
+            if not vlans:
+                print("VLAN kosong.")
+                continue
+            action = "ADD" if ch == "1" else "REMOVE"
+            print(f"TARGET VLANDB {action}: {compress_ranges(vlans)}")
+            confirm = input("Ketik YES untuk lanjut: ").strip()
+            if confirm != "YES":
+                print("Batal.")
+                continue
+
+            apply_vlan_database_update(z, vlans, action=action)
+            wr_after_each(z, note=f"VLANDB {action}")
+            print("Selesai + WR.")
             continue
 
         print("Pilihan tidak dikenal.")
@@ -901,14 +1480,18 @@ def menu():
     print("\n=== MENU ===")
     print("1) List ONU UNAUTH (deny) + MAC/MODEL      [CLEAR SCREEN]")
     print("2) AUTH PASS (2 tahap: cepat -> ENTER TX/RX) [CLEAR SCREEN]")
-    print("5) SMART Provision DENY (V2 MAC+FIXED ONU-ID, max 20/round) + WR DI AKHIR SAJA")
+    print("3) Search ONU by MAC (SEMUA PORT) [FULL/PREFIX MAC]")
+    print("5) RENUNBER ONU ID PORT AKTIF (PASS+DENY) -> 1..N BERURUTAN + APPLY VLAN + WR")
     print("6) Ganti interface (port OLT)")
     print("9) Count ONU terdaftar di SEMUA card/port")
     print("13) MODE TYPE (fallback / show / delete / tambah onu-type)")
-    print("14) Edit VLAN ONU (APPEND/REPLACE) + WR")
+    print("14) Edit VLAN ONU (APPEND/REPLACE) + WR per ONU")
     print("15) DELETE ALL ONU di port ini + WR")
     print("16) PRINT ONU di CARD aktif (2 tahap: cepat -> ENTER TX/RX)")
     print("17) REBOOT ONU (by ID / all port / all card)")
+    print("18) UPDATE VLAN SEMUA ONU PASS DI CARD AKTIF (CUSTOM VLAN) + WR")
+    print("19) UPLINK VLAN TAG MANAGER (XGE/GE) + WR   [BARU]")
+    print("20) VLAN DATABASE MANAGER + AUTO-SYNC + WR  [BARU]")
     print("0) Keluar")
 
 # ================== MAIN ==================
@@ -921,19 +1504,18 @@ def main():
     if not m:
         print("Format salah. Contoh: epon-olt_1/4/3")
         return
-
     onu_prefix = f"epon-onu_{m.group(1)}:"
 
     z = ZXAN(HOST, PORT, log)
     try:
-        z.login(USERNAME, PASSWORD)
+        z.login_fast(USERNAME, PASSWORD)
 
-        go_exec(z)
+        ensure_exec(z)
         z.send_wait_any("terminal length 0", 10, "paging-length0")
         z.send_wait_any("terminal page 0", 10, "paging-page0")
+        ensure_exec(z)
 
-        available_types = get_available_onu_types(z)
-        print(f"\nTotal TYPE ditemukan: {len(available_types)}")
+        available_types: List[str] = []
 
         while True:
             menu()
@@ -981,66 +1563,64 @@ def main():
                         print(f" - ONU {p.onu_no} | TYPE {p.onu_type or '-'} | TX {tx} | RX {rx}")
                 continue
 
+            if c == "3":
+                raw = input("Masukkan MAC / PREFIX (boleh banyak, pisah koma/spasi/enter):\n> ").strip()
+                queries = parse_mac_inputs(raw)
+                if not queries:
+                    print("Input kosong / format salah. Contoh FULL: E0:38:3F:63:91:B7 | PREFIX: E0:38:3F:63")
+                    continue
+                print("Scan SEMUA port... (bisa agak lama)")
+                results = search_macs_all_ports(z, queries)
+                print_search_results(queries, results)
+                continue
+
             if c == "5":
-                available_types = get_available_onu_types(z)
+                if not available_types:
+                    available_types = get_available_onu_types(z)
 
-                print("\nSMART Provision V2: MAC full + ONU-ID fixed. Max 20 ONU/round.")
-                print(f"ONU-ID range: {START_ONU_ID}..{MAX_ONU_ID} | Start={START_ONU_ID}")
-                print("Eksekusi langsung (tanpa konfirmasi). WR hanya di akhir jika ada sukses.\n")
+                print("\n=== RENUNBER PORT AKTIF ===")
+                print("WAJIB: ONU ID port ini akan jadi 1..N berurutan (PASS+DENY).")
+                print("PERINGATAN: ONU PASS bisa drop sesaat.")
+                confirm = input("Ketik RENUNBER untuk lanjut: ").strip()
+                if confirm != "RENUNBER":
+                    print("Batal.")
+                    continue
 
-                total_success = 0
+                total_ok = total_all = 0
                 try:
                     for r in range(1, MAX_PROV_ROUNDS + 1):
-                        denies_map = get_denies_by_mac(z, olt_if)
-                        if not denies_map:
-                            print(f"[Round {r}] DENY kosong. STOP.")
+                        passed = get_pass_list(z, olt_if)
+                        denied = get_deny_list(z, olt_if)
+                        if not passed and not denied:
+                            print(f"[Round {r}] Tidak ada ONU. STOP.")
                             break
 
-                        mac_list = sorted(denies_map.keys())
-                        if len(mac_list) > MAX_ONU_PER_ROUND:
-                            print(f"[Round {r}] DENY devices={len(mac_list)}. Diproses hanya {MAX_ONU_PER_ROUND}, sisanya ditahan.")
-                            mac_list = mac_list[:MAX_ONU_PER_ROUND]
-
-                        print(f"\n[Round {r}] Proses {len(mac_list)} DENY device(s) ...")
-
-                        round_success = 0
-                        for mac in mac_list:
-                            model_hint = denies_map[mac].model if mac in denies_map else None
-                            if provision_mac_v2(z, olt_if, onu_prefix, mac, model_hint, available_types):
-                                round_success += 1
-                                total_success += 1
-
-                        deny_left = get_denies_by_mac(z, olt_if)
-                        print(f"[Round {r}] Sisa DENY devices: {len(deny_left)}")
-
-                        if round_success == 0:
-                            print("[STOP] Tidak ada progress. Biasanya type belum tersedia atau auth port tidak cocok.")
+                        plan = build_port_sequential_plan(passed, denied, available_types)
+                        already_ok = all(it.old_id == it.new_id for it in plan)
+                        if already_ok and r > 1:
+                            print(f"[Round {r}] Sudah berurutan 1..N. STOP.")
                             break
 
+                        print(f"\n[Round {r}] Total ONU (PASS+DENY)={len(plan)} | Target ID: 1..{len(plan)}")
+                        ok, total = apply_plan_sequential_port(z, olt_if, onu_prefix, plan)
+                        total_ok += ok
+                        total_all += total
                         time.sleep(SLEEP_BETWEEN_ROUNDS_SEC)
 
                 except KeyboardInterrupt:
-                    print("\n[STOP] Provision dibatalkan (Ctrl+C).")
+                    print("\n[STOP] dibatalkan (Ctrl+C).")
+                except Exception as e:
+                    print(f"\n[ERROR] {e}")
 
-                deny_final = get_denies_by_mac(z, olt_if)
-                print(f"\nSELESAI. Total sukses (attempt)={total_success}. SISA DENY devices={len(deny_final)}")
-                for mac, d in deny_final.items():
-                    print(f" - ONU? {d.onu_no} | MAC {mac} | MODEL {d.model or '-'}")
-
-                if total_success > 0:
-                    print("\nMenjalankan END + WR sekali di akhir (ada perubahan)...")
-                    end_wr(z)
-                    print("END + WR selesai.")
-                else:
-                    print("\nTidak ada sukses, tidak menjalankan WR.")
+                print(f"\nSELESAI RENUNBER. OK={total_ok}/{total_all}")
                 continue
 
             if c == "9":
                 with silent(log):
                     roots = discover_root_cards_from_help(z)
                     ports: List[str] = []
-                    for r in roots:
-                        ports.extend(expand_ports_from_root(r, ports_per_card=8))
+                    for r0 in roots:
+                        ports.extend(expand_ports_from_root(r0, ports_per_card=8))
 
                     results: List[Tuple[str, int, int, int]] = []
                     grand_total = grand_pass = grand_deny = 0
@@ -1058,6 +1638,8 @@ def main():
                 continue
 
             if c == "13":
+                if not available_types:
+                    available_types = get_available_onu_types(z)
                 available_types = mode_type_menu(z, olt_if, available_types)
                 continue
 
@@ -1088,9 +1670,9 @@ def main():
                     onu_if = f"{onu_prefix}{onu_no}"
                     print(f" - Apply VLAN {vlans} mode={mode} => {onu_if}")
                     set_onu_vlans(z, onu_if, vlans, mode=mode)
+                    wr_after_each(z, note=f"VLAN {onu_if}")
 
-                end_wr(z)
-                print("Selesai edit VLAN + WR.")
+                print("Selesai edit VLAN (WR per-ONU).")
                 continue
 
             if c == "15":
@@ -1106,7 +1688,7 @@ def main():
                     continue
 
                 delete_onu_ids(z, olt_if, ids)
-                end_wr(z)
+                wr_after_each(z, note="DELETEALL")
                 print("DELETE ALL selesai + WR.")
                 continue
 
@@ -1114,7 +1696,6 @@ def main():
                 clear_screen()
                 print("\n=== LIST ONU CARD (TAHAP 1 CEPAT) ===")
                 all_pass, all_prefix = print_card_quick(z, olt_if)
-
                 choice = input("\nTekan ENTER untuk ambil TX/RX (atau ketik SKIP): ").strip().upper()
                 if choice == "":
                     print_card_optic(z, all_pass, all_prefix)
@@ -1143,6 +1724,27 @@ def main():
                     continue
 
                 print("Pilihan tidak dikenal.")
+                continue
+
+            if c == "18":
+                vlan_s = input("Masukkan VLAN custom (cth 16 / 16,52): ").strip()
+                vlans = parse_csv_ints(vlan_s)
+                if not vlans:
+                    print("VLAN kosong.")
+                    continue
+                mode = input("Mode APPEND / REPLACE: ").strip().upper()
+                if mode not in ("APPEND", "REPLACE"):
+                    print("Mode tidak valid.")
+                    continue
+                update_vlan_all_pass_on_card(z, olt_if, vlans, mode)
+                continue
+
+            if c == "19":
+                menu_uplink_vlan(z)
+                continue
+
+            if c == "20":
+                menu_vlan_database(z)
                 continue
 
             print("Pilihan tidak dikenal.")

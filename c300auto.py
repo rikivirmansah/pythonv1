@@ -16,11 +16,18 @@ PASSWORD = "zte"
 
 TIMEOUT = 30
 SHOW_TIMEOUT = 180
-CMD_DELAY = 0.01
+CMD_DELAY = 0
 
-# PATCH: prompt regex aman (hindari karakter aneh)
-PROMPT_ANY_REGEX = re.compile(rb"ZXAN(?:\([^)]+\))?#\s*$", re.MULTILINE)
-PROMPT_EXEC_REGEX = re.compile(rb"ZXAN#\s*$", re.MULTILINE)
+# Match prompt CLI umum: <hostname> or <hostname>(config...) diakhiri '#'
+# Contoh: ZXAN#, OLT01(config)#, ZTE_ABC(epon-olt_1/2/1)#, dll
+PROMPT_ANY_REGEX = re.compile(
+    rb"(?m)^[^\r\n#]{1,64}(?:\([^)]+\))?#\s*$"
+)
+
+# Match EXEC prompt (tanpa '(...)'): <hostname># 
+PROMPT_EXEC_REGEX = re.compile(
+    rb"(?m)^[^\r\n#]{1,64}#\s*$"
+)
 
 LOGIN_USER = [b"Username:", b"username:", b"Login:", b"login:"]
 LOGIN_PASS = [b"Password:", b"password:"]
@@ -356,8 +363,34 @@ class ZXAN:
 
 # ================== MODE HELPERS ==================
 def go_exec(z: ZXAN):
-    z.send_wait_any("end", 20, "go-exec-end")
-    z.send_wait_exec("", 5, "go-exec-confirm")
+    # Kirim 'end' sekali, tunggu sampai prompt EXEC (ZXAN#)
+    z.flush()
+    z.log.info("SEND: end")
+    z.tn.write(b"end\n")
+    if CMD_DELAY > 0:
+        time.sleep(CMD_DELAY)
+
+    idx, _, data = z.tn.expect([PROMPT_EXEC_REGEX, PROMPT_ANY_REGEX], 20)
+    out = data.decode(errors="ignore")
+
+    # Kalau sudah EXEC (ZXAN#) selesai
+    if idx == 0:
+        return
+
+    # Kalau masih belum EXEC (misal masih di mode config/level lain), coba exit beberapa kali
+    for _ in range(3):
+        z.flush()
+        z.log.info("SEND: exit")
+        z.tn.write(b"exit\n")
+        if CMD_DELAY > 0:
+            time.sleep(CMD_DELAY)
+
+        idx, _, _ = z.tn.expect([PROMPT_EXEC_REGEX, PROMPT_ANY_REGEX], 10)
+        if idx == 0:
+            return
+
+    # Terakhir: paksa tunggu EXEC, biar kalau gagal keliatan errornya
+    raise TimeoutError("Gagal kembali ke EXEC prompt (ZXAN#) setelah end/exit.")
 
 def ensure_exec(z: ZXAN):
     go_exec(z)
@@ -1441,14 +1474,7 @@ def main():
         PROV_VLANS = ask_prov_vlans_after_login()
         print("PROV_VLANS aktif:", compress_ranges(PROV_VLANS))
 
-        try:
-            enter_olt(z, olt_if)
-            z.send_wait_any("exit", 10, "exit-olt-target")
-            z.send_wait_any("exit", 10, "exit-olt-parent")
-            z.send_wait_any("exit", 10, "exit-epon")
-            ensure_exec(z)
-        except Exception:
-            ensure_exec(z)
+       
 
         available_types: List[str] = []
 
@@ -1693,4 +1719,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
